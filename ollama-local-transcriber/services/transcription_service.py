@@ -68,13 +68,21 @@ def transcribe_audio(
     vad_filter: bool = True,
     word_timestamps: bool = False,
     translate: bool = False,
+    condition_on_previous_text: bool = False,
+    progress_callback: Any | None = None,
+    cancel_check: Any | None = None,
 ) -> dict[str, Any]:
-    """Transcribe an audio file locally and return metadata plus segments."""
+    """Transcribe an audio file locally and return metadata plus segments.
+
+    progress_callback(fraction, text) is called for every segment.
+    cancel_check() is called between segments; returning True stops early.
+    """
     start_time = time.perf_counter()
     device = resolve_device(selected_device)
     selected_compute = safe_compute_type(device, compute_type)
     model = get_whisper_model(model_name, device, selected_compute)
 
+    cancelled = False
     try:
         segments_iter, info = model.transcribe(
             str(audio_path),
@@ -83,10 +91,15 @@ def transcribe_audio(
             vad_filter=vad_filter,
             word_timestamps=word_timestamps,
             task="translate" if translate else "transcribe",
+            condition_on_previous_text=condition_on_previous_text,
         )
+        duration = float(getattr(info, "duration", 0.0) or 0.0)
         segments: list[dict[str, Any]] = []
         text_parts: list[str] = []
         for index, segment in enumerate(segments_iter, start=1):
+            if cancel_check and cancel_check():
+                cancelled = True
+                break
             item: dict[str, Any] = {
                 "id": index,
                 "start": float(segment.start),
@@ -106,6 +119,9 @@ def transcribe_audio(
             segments.append(item)
             if item["text"]:
                 text_parts.append(item["text"])
+            if progress_callback:
+                fraction = (float(item["end"]) / duration) if duration else 0.0
+                progress_callback(min(0.99, fraction), item["text"])
     except MemoryError as exc:
         raise TranscriptionError("Insufficient RAM or VRAM during transcription.") from exc
     except Exception as exc:
@@ -122,4 +138,5 @@ def transcribe_audio(
         "device": device,
         "compute_type": selected_compute,
         "model": model_name,
+        "cancelled": cancelled,
     }

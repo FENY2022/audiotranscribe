@@ -20,7 +20,21 @@ class MediaProcessingError(RuntimeError):
 
 def ffmpeg_available() -> bool:
     """Return True when ffmpeg is available on PATH."""
-    return shutil.which("ffmpeg") is not None
+    return _ffmpeg_executable() is not None
+
+
+def _ffmpeg_executable() -> str | None:
+    """Find FFmpeg from PATH or common Windows package locations."""
+    path_match = shutil.which("ffmpeg")
+    if path_match:
+        return path_match
+
+    winget_root = Path.home() / "AppData" / "Local" / "Microsoft" / "WinGet" / "Packages"
+    if winget_root.exists():
+        matches = sorted(winget_root.glob("Gyan.FFmpeg_*/*/bin/ffmpeg.exe"), reverse=True)
+        if matches:
+            return str(matches[0])
+    return None
 
 
 def prepare_audio_for_transcription(source_path: Path, original_name: str) -> tuple[Path, list[Path]]:
@@ -29,12 +43,13 @@ def prepare_audio_for_transcription(source_path: Path, original_name: str) -> tu
     The original uploaded file is never modified. A converted temporary WAV is
     returned and should be deleted by the caller after processing.
     """
-    if not ffmpeg_available():
+    ffmpeg_path = _ffmpeg_executable()
+    if not ffmpeg_path:
         raise FFmpegMissingError("FFmpeg is missing. Install FFmpeg and add it to your PATH.")
 
     output_path = unique_temp_path(original_name, ".wav")
     command = [
-        "ffmpeg",
+        ffmpeg_path,
         "-y",
         "-i",
         str(source_path),

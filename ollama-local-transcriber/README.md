@@ -130,16 +130,18 @@ Faster-Whisper downloads the selected Whisper model during first use. The app wa
 - Whisper model: `small`
 - Device: `CPU`
 - Compute type: `int8`
-- Beam size: `5`
+- Transcription speed: `Fastest` (beam size 1, greedy decoding)
 - VAD: Enabled
 - Recommended Ollama model: `qwen3:4b`
+
+Fastest mode is the default on CPU and is roughly 3-5x faster than beam size 5. For the quickest results use the `tiny` or `base` model; for better accuracy use `small` or `medium` at a slower speed mode.
 
 ## Recommended NVIDIA GPU Settings
 
 - Whisper model: `medium` or `large-v3`
 - Device: `CUDA`
 - Compute type: `float16`
-- Beam size: `5`
+- Transcription speed: `Accurate` (beam size 5)
 - VAD: Enabled
 
 Do not assume CUDA is installed. If CUDA is unavailable, use CPU.

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -24,6 +26,12 @@ LANGUAGE_OPTIONS = {
     "Filipino": "tl",
     "Cebuano": "ceb",
     "Spanish": "es",
+}
+
+SPEED_MODES = {
+    "Fastest": {"beam_size": 1, "condition_on_previous_text": False},
+    "Balanced": {"beam_size": 2, "condition_on_previous_text": False},
+    "Accurate": {"beam_size": 5, "condition_on_previous_text": True},
 }
 
 
@@ -54,6 +62,20 @@ def init_state() -> None:
         "whisper_settings": {},
         "ollama_model": "qwen3:4b",
         "cancel_requested": False,
+        "transcribe_state": {
+            "active": False,
+            "done": False,
+            "fraction": 0.0,
+            "text": "",
+            "message": "Idle",
+            "error": None,
+            "error_type": None,
+            "result": None,
+            "cancelled": False,
+            "temp_files": [],
+            "started": 0.0,
+        },
+        "cancel_flag": {"value": False},
     }
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
@@ -163,7 +185,20 @@ def render_sidebar() -> dict[str, Any]:
     compute_options = ["int8", "int8_float16", "float16", "float32"]
     compute_type = st.sidebar.selectbox("Compute type", compute_options, index=compute_options.index(default_compute))
     language_label = st.sidebar.selectbox("Language", list(LANGUAGE_OPTIONS.keys()), index=0)
-    beam_size = st.sidebar.slider("Beam size", 1, 10, 5)
+    speed_options = list(SPEED_MODES.keys()) + ["Custom"]
+    default_speed = "Fastest" if resolved_for_compute == "cpu" else "Accurate"
+    speed_mode = st.sidebar.selectbox(
+        "Transcription speed",
+        speed_options,
+        index=speed_options.index(default_speed),
+        help="Fastest uses greedy decoding (beam 1) and is much quicker on CPU. Accurate uses beam 5.",
+    )
+    beam_size = st.sidebar.slider("Beam size", 1, 10, 5, disabled=speed_mode != "Custom")
+    if speed_mode in SPEED_MODES:
+        beam_size = SPEED_MODES[speed_mode]["beam_size"]
+        condition_on_previous_text = SPEED_MODES[speed_mode]["condition_on_previous_text"]
+    else:
+        condition_on_previous_text = True
     vad_filter = st.sidebar.checkbox("Enable VAD filter", value=True)
     include_timestamps = st.sidebar.checkbox("Include timestamps", value=True)
     word_timestamps = st.sidebar.checkbox("Word-level timestamps", value=False)
@@ -193,7 +228,9 @@ def render_sidebar() -> dict[str, Any]:
         "compute_type": compute_type,
         "language": LANGUAGE_OPTIONS[language_label],
         "language_label": language_label,
+        "speed_mode": speed_mode,
         "beam_size": beam_size,
+        "condition_on_previous_text": condition_on_previous_text,
         "vad_filter": vad_filter,
         "include_timestamps": include_timestamps,
         "word_timestamps": word_timestamps,
@@ -223,21 +260,25 @@ def render_file_info() -> None:
         st.caption(f"Processing time: {metadata.get('processing_time', 0):.1f} seconds")
 
 
-def run_transcription(settings: dict[str, Any]) -> None:
-    """Prepare media and run Faster-Whisper transcription."""
-    source = Path(st.session_state.uploaded_file_path)
-    temp_files: list[Path] = []
-    progress = st.progress(0, text="Preparing media")
+def fmt_elapsed(seconds: float) -> str:
+    """Format seconds as H:MM:SS."""
+    total = int(seconds)
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours:d}:{minutes:02d}:{secs:02d}"
+
+
+def _transcription_worker(settings: dict[str, Any], audio_path: Path, state: dict[str, Any], cancel: dict[str, bool]) -> None:
+    """Run Faster-Whisper in a background thread, publishing live progress."""
+    started = state["started"]
+
+    def on_progress(fraction: float, text: str) -> None:
+        state["fraction"] = fraction
+        state["text"] = text
+        state["message"] = "Transcribing audio"
+        state["elapsed"] = time.monotonic() - started
+
     try:
-        log_message("Preparing media")
-        audio_path, generated = media_service.prepare_audio_for_transcription(source, st.session_state.uploaded_filename)
-        temp_files.extend(generated)
-        progress.progress(25, text="Loading Whisper model")
-        log_message("Loading Whisper model")
-        if settings["whisper_model"] in {"medium", "large-v3", "turbo"}:
-            st.warning("Large Whisper models may download on first use and require more RAM, VRAM, disk space, and time.")
-        progress.progress(45, text="Transcribing audio")
-        log_message("Transcribing audio")
         result = transcription_service.transcribe_audio(
             audio_path=audio_path,
             model_name=settings["whisper_model"],
@@ -248,36 +289,115 @@ def run_transcription(settings: dict[str, Any]) -> None:
             vad_filter=settings["vad_filter"],
             word_timestamps=settings["word_timestamps"],
             translate=settings["translate"],
+            condition_on_previous_text=settings["condition_on_previous_text"],
+            progress_callback=on_progress,
+            cancel_check=lambda: cancel["value"],
         )
-        progress.progress(80, text="Detecting language")
-        text = format_segments_with_timestamps(result["segments"]) if settings["include_timestamps"] else result["text"]
-        st.session_state.raw_transcript = text
-        st.session_state.cleaned_transcript = ""
-        st.session_state.summary = ""
-        st.session_state.minutes = ""
-        st.session_state.action_items = ""
-        st.session_state.segments = result["segments"]
-        st.session_state.metadata = {
-            "language": result.get("language"),
-            "language_probability": result.get("language_probability"),
-            "duration": result.get("duration"),
-            "processing_time": result.get("processing_time"),
-            "device": result.get("device"),
-            "compute_type": result.get("compute_type"),
-            "whisper_model": result.get("model"),
-            "date_processed": datetime.now().isoformat(timespec="seconds"),
-        }
-        st.session_state.whisper_settings = {k: settings[k] for k in (
-            "whisper_model", "device", "compute_type", "language_label", "beam_size", "vad_filter", "include_timestamps", "word_timestamps", "translate"
-        )}
-        progress.progress(100, text="Complete")
-        log_message("Transcription complete")
-        st.success("Transcription complete.")
+        state["result"] = result
+        state["message"] = "Complete"
     except Exception as exc:
-        show_error("Transcription failed. Check the uploaded media, FFmpeg, Whisper model, device, and compute settings.", exc)
+        state["error"] = str(exc)
+        state["error_type"] = type(exc).__name__
+        state["message"] = "Error"
     finally:
-        for temp_file in temp_files:
-            safe_unlink(temp_file)
+        state["done"] = True
+        state["elapsed"] = time.monotonic() - started
+
+
+def start_transcription(settings: dict[str, Any]) -> None:
+    """Prepare media and launch transcription in a background thread."""
+    state = st.session_state.transcribe_state
+    if state["active"]:
+        st.warning("Transcription is already running.")
+        return
+    source = Path(st.session_state.uploaded_file_path)
+    try:
+        log_message("Preparing media")
+        audio_path, generated = media_service.prepare_audio_for_transcription(source, st.session_state.uploaded_filename)
+    except Exception as exc:
+        show_error("Media preparation failed. Check FFmpeg and the uploaded file.", exc)
+        return
+
+    temp_files = list(dict.fromkeys(str(path) for path in generated))
+    cancel = st.session_state.cancel_flag
+    cancel["value"] = False
+    st.session_state.cancel_requested = False
+    state.update(
+        {
+            "active": True,
+            "done": False,
+            "fraction": 0.0,
+            "text": "",
+            "message": "Loading Whisper model",
+            "error": None,
+            "error_type": None,
+            "result": None,
+            "cancelled": False,
+            "temp_files": temp_files,
+            "started": time.monotonic(),
+        }
+    )
+    log_message("Loading Whisper model")
+    threading.Thread(target=_transcription_worker, args=(settings, audio_path, state, cancel), daemon=True).start()
+
+
+def render_transcription_progress() -> None:
+    """Render live progress while transcription runs."""
+    status = st.session_state.transcribe_state
+    elapsed = time.monotonic() - status["started"] if status["started"] else 0.0
+    percent = min(99, int(status["fraction"] * 100))
+    st.progress(
+        min(0.99, status["fraction"]),
+        text=f"{status['message']} — {percent}% complete (elapsed {fmt_elapsed(elapsed)})",
+    )
+    if status["text"]:
+        st.markdown("**Live preview (partial transcript):**")
+        st.text_area("Partial transcript", status["text"], height=240, disabled=True)
+
+
+def finalize_transcription(settings: dict[str, Any]) -> None:
+    """Store transcription results into session state and clean temp files."""
+    status = st.session_state.transcribe_state
+    for temp_path in status["temp_files"]:
+        safe_unlink(Path(temp_path))
+    status["temp_files"] = []
+    status["active"] = False
+
+    if status["error"]:
+        show_error(
+            "Transcription failed. Check the uploaded media, FFmpeg, Whisper model, device, and compute settings.",
+            Exception(f"{status['error_type']}: {status['error']}"),
+        )
+        return
+
+    result = status["result"]
+    text = format_segments_with_timestamps(result["segments"]) if settings["include_timestamps"] else result["text"]
+    st.session_state.raw_transcript = text
+    st.session_state.cleaned_transcript = ""
+    st.session_state.summary = ""
+    st.session_state.minutes = ""
+    st.session_state.action_items = ""
+    st.session_state.segments = result["segments"]
+    st.session_state.metadata = {
+        "language": result.get("language"),
+        "language_probability": result.get("language_probability"),
+        "duration": result.get("duration"),
+        "processing_time": result.get("processing_time"),
+        "device": result.get("device"),
+        "compute_type": result.get("compute_type"),
+        "whisper_model": result.get("model"),
+        "date_processed": datetime.now().isoformat(timespec="seconds"),
+    }
+    st.session_state.whisper_settings = {k: settings[k] for k in (
+        "whisper_model", "device", "compute_type", "language_label", "speed_mode", "beam_size",
+        "vad_filter", "include_timestamps", "word_timestamps", "translate"
+    )}
+    if result.get("cancelled"):
+        st.warning("Transcription cancelled. Partial results were kept.")
+        log_message("Transcription cancelled by user")
+    else:
+        st.success("Transcription complete.")
+        log_message("Transcription complete")
 
 
 def ai_progress_callback(progress_bar):
@@ -403,15 +523,26 @@ def main() -> None:
     render_file_info()
 
     st.subheader("Transcription Settings")
-    st.caption("Faster-Whisper downloads the selected model during first use. Large models may require substantial RAM, VRAM, disk space, and time.")
+    st.caption("Faster-Whisper downloads the selected model during first use. Large models may require substantial RAM, VRAM, disk space, and time. For fast CPU transcription use the Fastest speed mode.")
     col_a, col_b = st.columns([1, 1])
-    start_clicked = col_a.button("Start Transcription", type="primary", disabled=not st.session_state.uploaded_file_path)
-    if col_b.button("Stop or Cancel"):
+    start_clicked = col_a.button(
+        "Start Transcription",
+        type="primary",
+        disabled=not st.session_state.uploaded_file_path or st.session_state.transcribe_state["active"],
+    )
+    if col_b.button("Stop or Cancel", disabled=not st.session_state.transcribe_state["active"]):
+        st.session_state.cancel_flag["value"] = True
         st.session_state.cancel_requested = True
-        st.warning("Cancel requested. If a model is currently transcribing, it may stop after the current operation completes.")
+        st.warning("Cancelling transcription after the current segment...")
     if start_clicked:
-        st.session_state.cancel_requested = False
-        run_transcription(settings)
+        start_transcription(settings)
+
+    if st.session_state.transcribe_state["active"] and not st.session_state.transcribe_state["done"]:
+        render_transcription_progress()
+        time.sleep(0.5)
+        st.rerun()
+    elif st.session_state.transcribe_state["active"] and st.session_state.transcribe_state["done"]:
+        finalize_transcription(settings)
 
     st.subheader("Ollama Processing")
     ai_disabled = not bool(st.session_state.raw_transcript.strip()) or not settings["ollama_ok"]
@@ -433,7 +564,7 @@ def main() -> None:
     render_tabs()
     render_exports()
 
-    if st.button("Clear Session"):
+    if st.button("Clear Session", disabled=st.session_state.transcribe_state["active"]):
         clear_session()
         st.rerun()
 
