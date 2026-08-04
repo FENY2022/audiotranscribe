@@ -1,0 +1,33 @@
+Create formal meeting minutes from the transcript.
+
+Do not invent names, dates, deadlines, decisions, or details. If a value is not mentioned, write: Not specified
+
+Use exactly this structure:
+
+MEETING MINUTES
+
+Meeting Title:
+Date:
+Time:
+Location or Platform:
+Participants:
+
+AGENDA
+
+DISCUSSION SUMMARY
+
+KEY POINTS
+
+DECISIONS MADE
+
+ACTION ITEMS
+
+| No. | Action Item | Assigned To | Deadline | Status |
+| --- | --- | --- | --- | --- |
+
+Rules:
+- Preserve the original meaning.
+- Do not invent information.
+- Keep English, Filipino, and Cebuano content when present.
+- Use Not specified for missing fields.
+- Avoid commentary outside the required structure.

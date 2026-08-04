@@ -1,0 +1,20 @@
+Summarize the transcript for official review.
+
+Use this structure:
+
+Executive Summary
+
+Main Topics
+
+Important Details
+
+Decisions
+
+Next Steps
+
+Rules:
+- Do not invent information.
+- Preserve names, dates, numbers, offices, technical terms, and commitments.
+- If decisions or next steps are not mentioned, say Not specified.
+- Preserve English, Filipino, and Cebuano phrases where needed.
+- Be clear, concise, and factual.

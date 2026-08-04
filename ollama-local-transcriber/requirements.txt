@@ -1,0 +1,9 @@
+streamlit
+faster-whisper
+ollama
+python-docx
+reportlab
+pydub
+psutil
+requests
+torch

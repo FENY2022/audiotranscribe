@@ -1,0 +1,11 @@
+venv/
+__pycache__/
+*.pyc
+.streamlit/secrets.toml
+temp/*
+outputs/*
+logs/*
+!temp/.gitkeep
+!outputs/.gitkeep
+!logs/.gitkeep
+*.log

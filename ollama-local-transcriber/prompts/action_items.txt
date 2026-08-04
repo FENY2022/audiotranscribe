@@ -1,0 +1,13 @@
+Extract action items from the transcript.
+
+Return a structured Markdown table:
+
+| No. | Action Item | Responsible Person | Deadline | Status |
+| --- | --- | --- | --- | --- |
+
+Rules:
+- Do not invent action items.
+- Do not invent names, deadlines, or status values.
+- If responsible person, deadline, or status is not stated, use Not specified.
+- If no clear action item is found, return exactly:
+No clear action items were identified in the transcript.
