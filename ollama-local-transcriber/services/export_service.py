@@ -120,7 +120,6 @@ def export_pdf(data: dict[str, Any]) -> bytes:
         from reportlab.lib.styles import getSampleStyleSheet
         from reportlab.lib.units import inch
         from reportlab.platypus import PageBreak, Paragraph, SimpleDocTemplate, Spacer
-        from reportlab.platypus.flowables import KeepTogether
         from xml.sax.saxutils import escape
     except ImportError as exc:
         raise ExportError("reportlab is not installed.") from exc
@@ -161,7 +160,8 @@ def export_pdf(data: dict[str, Any]) -> bytes:
             blocks = str(content or "Not specified").split("\n")
             for block in blocks:
                 safe = escape(block) if block.strip() else "&nbsp;"
-                story.append(KeepTogether([Paragraph(safe, styles["BodyText"]), Spacer(1, 4)]))
+                story.append(Paragraph(safe, styles["BodyText"]))
+                story.append(Spacer(1, 4))
 
         def add_page_number(canvas, document):
             canvas.saveState()

@@ -370,7 +370,7 @@ def render_exports() -> None:
 
 def main() -> None:
     """Run the Streamlit app."""
-    st.set_page_config(page_title=APP_NAME, page_icon="", layout="wide")
+    st.set_page_config(page_title=APP_NAME, layout="wide")
     setup_logging()
     init_state()
     render_styles()
