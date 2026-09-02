@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import logging
+import mimetypes
 import threading
 import time
+import zipfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -20,12 +22,18 @@ from utils.validators import DEFAULT_MAX_UPLOAD_BYTES, SUPPORTED_EXTENSIONS, val
 
 APP_NAME = "Ollama Local Transcriber"
 DEFAULT_OLLAMA_HOST = "http://localhost:11434"
+MAX_CUT_MINUTES = media_service.MAX_CUT_SECONDS // 60
 LANGUAGE_OPTIONS = {
     "Auto Detect": None,
     "English": "en",
-    "Filipino": "tl",
+    "Tagalog": "tl",
     "Cebuano": "ceb",
-    "Spanish": "es",
+}
+SUPPORTED_AUTO_LANGUAGES = {code for code in LANGUAGE_OPTIONS.values() if code}
+LANGUAGE_DISPLAY_NAMES = {
+    "en": "English",
+    "tl": "Tagalog",
+    "ceb": "Cebuano",
 }
 
 SPEED_MODES = {
@@ -76,6 +84,12 @@ def init_state() -> None:
             "started": 0.0,
         },
         "cancel_flag": {"value": False},
+        "cutter_file_path": None,
+        "cutter_filename": "",
+        "cutter_file_size": 0,
+        "cutter_duration": 0.0,
+        "cutter_results": [],
+        "cutter_zip_path": None,
     }
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
@@ -86,6 +100,13 @@ def log_message(message: str) -> None:
     stamp = datetime.now().strftime("%H:%M:%S")
     st.session_state.processing_log.append(f"[{stamp}] {message}")
     logging.info(message)
+
+
+def display_language(language_code: str | None) -> str:
+    """Return a friendly display label for a Whisper language code."""
+    if not language_code:
+        return "Not available"
+    return LANGUAGE_DISPLAY_NAMES.get(language_code, language_code)
 
 
 def show_error(message: str, exc: Exception | None = None) -> None:
@@ -186,7 +207,7 @@ def render_sidebar() -> dict[str, Any]:
     compute_type = st.sidebar.selectbox("Compute type", compute_options, index=compute_options.index(default_compute))
     language_label = st.sidebar.selectbox("Language", list(LANGUAGE_OPTIONS.keys()), index=0)
     speed_options = list(SPEED_MODES.keys()) + ["Custom"]
-    default_speed = "Fastest" if resolved_for_compute == "cpu" else "Accurate"
+    default_speed = "Accurate"
     speed_mode = st.sidebar.selectbox(
         "Transcription speed",
         speed_options,
@@ -251,7 +272,7 @@ def render_file_info() -> None:
         ("Filename", st.session_state.uploaded_filename or "No file"),
         ("File size", human_file_size(st.session_state.uploaded_file_size) if st.session_state.uploaded_file_size else "Not available"),
         ("Duration", f"{metadata.get('duration', 0):.1f} sec" if metadata else "Not available"),
-        ("Detected language", metadata.get("language", "Not available") if metadata else "Not available"),
+        ("Detected language", display_language(metadata.get("language")) if metadata else "Not available"),
         ("Segments", str(len(st.session_state.segments)) if st.session_state.segments else "0"),
     ]
     for col, (label, value) in zip(cols, values):
@@ -380,6 +401,7 @@ def finalize_transcription(settings: dict[str, Any]) -> None:
     st.session_state.segments = result["segments"]
     st.session_state.metadata = {
         "language": result.get("language"),
+        "language_name": display_language(result.get("language")),
         "language_probability": result.get("language_probability"),
         "duration": result.get("duration"),
         "processing_time": result.get("processing_time"),
@@ -396,6 +418,13 @@ def finalize_transcription(settings: dict[str, Any]) -> None:
         st.warning("Transcription cancelled. Partial results were kept.")
         log_message("Transcription cancelled by user")
     else:
+        detected_language = result.get("language")
+        if settings["language"] is None and detected_language not in SUPPORTED_AUTO_LANGUAGES:
+            st.warning(
+                "Auto-detect found an unsupported language "
+                f"({display_language(detected_language)}). Only English, Tagalog, and Cebuano are intended, "
+                "but the transcript was kept."
+            )
         st.success("Transcription complete.")
         log_message("Transcription complete")
 
@@ -488,12 +517,240 @@ def render_exports() -> None:
         show_error("Export failed. Check generated text and installed export packages.", exc)
 
 
+def clear_cutter_files() -> None:
+    """Clear cutter upload and generated result files."""
+    path = st.session_state.get("cutter_file_path")
+    if path:
+        safe_unlink(Path(path))
+    zip_path = st.session_state.get("cutter_zip_path")
+    if zip_path:
+        safe_unlink(Path(zip_path))
+    for result in st.session_state.get("cutter_results", []):
+        safe_unlink(Path(result["path"]))
+    st.session_state.cutter_file_path = None
+    st.session_state.cutter_filename = ""
+    st.session_state.cutter_file_size = 0
+    st.session_state.cutter_duration = 0.0
+    st.session_state.cutter_results = []
+    st.session_state.cutter_zip_path = None
+
+
+def clear_cutter_results() -> None:
+    """Clear generated cutter outputs while keeping the uploaded source file."""
+    zip_path = st.session_state.get("cutter_zip_path")
+    if zip_path:
+        safe_unlink(Path(zip_path))
+    for result in st.session_state.get("cutter_results", []):
+        safe_unlink(Path(result["path"]))
+    st.session_state.cutter_results = []
+    st.session_state.cutter_zip_path = None
+
+
+def build_cutter_zip_file(results: list[dict[str, Any]]) -> Path:
+    """Build a ZIP archive file containing every existing cut result."""
+    output_path = unique_temp_path("media_cuts.zip", ".zip")
+    with zipfile.ZipFile(output_path, "w", compression=zipfile.ZIP_STORED) as archive:
+        for result in results:
+            path = Path(result["path"])
+            if path.exists():
+                archive.write(path, arcname=result["name"])
+    return output_path
+
+
+def cutter_result_name(filename: str, start_min: float, end_min: float, part: int | None = None) -> str:
+    """Build a stable filename for a generated media cut."""
+    suffix = Path(filename).suffix
+    stem = Path(filename).stem
+    part_label = f"_part{part:02d}" if part is not None else ""
+    return f"{stem}{part_label}_cut_{start_min:.2f}-{end_min:.2f}min{suffix}"
+
+
+def render_cutter_page() -> None:
+    """Render a separate media cutter page."""
+    st.title("Media Cutter")
+    st.caption(f"Cut audio or video locally with FFmpeg. Each exported cut can be up to {MAX_CUT_MINUTES} minutes.")
+
+    uploaded = st.file_uploader(
+        "Choose audio or video to cut",
+        type=sorted(ext.lstrip(".") for ext in SUPPORTED_EXTENSIONS),
+        key="cutter_upload",
+    )
+    if uploaded is not None:
+        try:
+            validate_upload(uploaded.name, uploaded.size, DEFAULT_MAX_UPLOAD_BYTES)
+            safe_name = sanitize_filename(uploaded.name)
+            if safe_name != st.session_state.cutter_filename or uploaded.size != st.session_state.cutter_file_size:
+                clear_cutter_files()
+                path = save_uploaded_file(uploaded)
+                st.session_state.cutter_file_path = str(path)
+                st.session_state.cutter_filename = safe_name
+                st.session_state.cutter_file_size = uploaded.size
+                st.session_state.cutter_duration = media_service.media_duration_seconds(path)
+        except Exception as exc:
+            show_error("Media upload or inspection failed. Check FFmpeg and the uploaded file.", exc)
+
+    if not st.session_state.cutter_file_path:
+        st.info("Upload a supported media file to choose a cut range.")
+        return
+
+    duration = float(st.session_state.cutter_duration or 0.0)
+    duration_minutes = duration / 60
+    st.subheader("Source Media")
+    cols = st.columns(3)
+    cols[0].metric("Filename", st.session_state.cutter_filename)
+    cols[1].metric("File size", human_file_size(st.session_state.cutter_file_size))
+    cols[2].metric("Duration", fmt_elapsed(duration))
+
+    st.subheader("Cut Range")
+    default_end = min(duration_minutes, float(MAX_CUT_MINUTES))
+    start_min, end_min = st.slider(
+        "Start and end time in minutes",
+        min_value=0.0,
+        max_value=duration_minutes,
+        value=(0.0, default_end),
+        step=0.01,
+    )
+    cut_minutes = end_min - start_min
+    st.caption(f"Selected length: {cut_minutes:.1f} minutes. Maximum allowed: {MAX_CUT_MINUTES} minutes.")
+
+    can_cut = 0 < cut_minutes <= MAX_CUT_MINUTES
+    if cut_minutes > MAX_CUT_MINUTES:
+        st.warning(f"The selected range is too long. Reduce it to {MAX_CUT_MINUTES} minutes or less.")
+
+    if st.button("Cut Media", type="primary", disabled=not can_cut):
+        try:
+            progress_bar = st.progress(0.0, text="Starting media cut...")
+
+            def on_cut_progress(fraction: float, message: str) -> None:
+                progress_bar.progress(fraction, text=f"{message} — {int(fraction * 100)}%")
+
+            with st.spinner("Cutting media with FFmpeg. Please wait..."):
+                result_path = media_service.cut_media(
+                    Path(st.session_state.cutter_file_path),
+                    st.session_state.cutter_filename,
+                    start_min * 60,
+                    end_min * 60,
+                    progress_callback=on_cut_progress,
+                )
+            progress_bar.progress(1.0, text="Cut complete — 100%")
+            result_name = cutter_result_name(st.session_state.cutter_filename, start_min, end_min)
+            st.session_state.cutter_results = st.session_state.cutter_results + [
+                {
+                    "path": str(result_path),
+                    "name": result_name,
+                    "start_min": start_min,
+                    "end_min": end_min,
+                    "size": result_path.stat().st_size,
+                }
+            ]
+            old_zip = st.session_state.get("cutter_zip_path")
+            if old_zip:
+                safe_unlink(Path(old_zip))
+                st.session_state.cutter_zip_path = None
+            st.success("Media cut complete. The cut was added to the download list.")
+        except Exception as exc:
+            show_error("Media cutting failed. Check FFmpeg and the selected range.", exc)
+
+    st.subheader("Auto Split to ZIP")
+    st.caption(f"This cuts the full recording into parts of up to {MAX_CUT_MINUTES} minutes, then prepares one ZIP file.")
+    total_parts = max(1, int((duration + media_service.MAX_CUT_SECONDS - 0.001) // media_service.MAX_CUT_SECONDS))
+    st.write(f"This recording will produce {total_parts} cut file(s).")
+    if st.button("Cut Full Recording and Prepare ZIP"):
+        try:
+            clear_cutter_results()
+            source_path = Path(st.session_state.cutter_file_path)
+            new_results: list[dict[str, Any]] = []
+            overall_progress = st.progress(0.0, text="Starting full recording cut...")
+
+            for part in range(total_parts):
+                start_seconds = part * media_service.MAX_CUT_SECONDS
+                end_seconds = min(duration, start_seconds + media_service.MAX_CUT_SECONDS)
+                start_minutes = start_seconds / 60
+                end_minutes = end_seconds / 60
+
+                def on_part_progress(fraction: float, message: str, part_number: int = part + 1) -> None:
+                    overall_fraction = (part + fraction) / total_parts
+                    overall_progress.progress(
+                        min(0.99, overall_fraction),
+                        text=f"{message} part {part_number} of {total_parts} — {int(overall_fraction * 100)}%",
+                    )
+
+                result_path = media_service.cut_media(
+                    source_path,
+                    st.session_state.cutter_filename,
+                    start_seconds,
+                    end_seconds,
+                    progress_callback=on_part_progress,
+                )
+                new_results.append(
+                    {
+                        "path": str(result_path),
+                        "name": cutter_result_name(st.session_state.cutter_filename, start_minutes, end_minutes, part + 1),
+                        "start_min": start_minutes,
+                        "end_min": end_minutes,
+                        "size": result_path.stat().st_size,
+                    }
+                )
+
+            overall_progress.progress(0.99, text="Preparing ZIP file...")
+            st.session_state.cutter_results = new_results
+            st.session_state.cutter_zip_path = str(build_cutter_zip_file(new_results))
+            overall_progress.progress(1.0, text="ZIP ready — 100%")
+            st.success("Full recording was cut and saved into a ZIP file.")
+        except Exception as exc:
+            show_error("Full recording cut failed. Check FFmpeg and available disk space.", exc)
+
+    existing_results = [result for result in st.session_state.cutter_results if Path(result["path"]).exists()]
+    st.session_state.cutter_results = existing_results
+    if existing_results:
+        st.subheader("Cut Audio/Video Downloads")
+        for index, result in enumerate(existing_results, start=1):
+            result_path = Path(result["path"])
+            mime_type = mimetypes.guess_type(result["name"])[0] or "application/octet-stream"
+            cols = st.columns([3, 1, 1])
+            cols[0].write(f"{index}. `{result['name']}`")
+            cols[1].caption(f"{result['start_min']:.2f}-{result['end_min']:.2f} min")
+            cols[2].download_button(
+                "Download",
+                result_path.read_bytes(),
+                file_name=result["name"],
+                mime=mime_type,
+                key=f"download_cut_{index}_{result['name']}",
+            )
+
+        st.divider()
+        if st.button("Prepare ZIP for All Cuts"):
+            old_zip = st.session_state.get("cutter_zip_path")
+            if old_zip:
+                safe_unlink(Path(old_zip))
+            with st.spinner("Preparing ZIP file. Large cuts may take a while..."):
+                st.session_state.cutter_zip_path = str(build_cutter_zip_file(existing_results))
+
+        zip_path = st.session_state.get("cutter_zip_path")
+        if zip_path and Path(zip_path).exists():
+            st.download_button(
+                "Download All Cuts as ZIP",
+                Path(zip_path).read_bytes(),
+                file_name="media_cuts.zip",
+                mime="application/zip",
+            )
+
+    if st.button("Clear Cutter"):
+        clear_cutter_files()
+        st.rerun()
+
+
 def main() -> None:
     """Run the Streamlit app."""
     st.set_page_config(page_title=APP_NAME, layout="wide")
     setup_logging()
     init_state()
     render_styles()
+    page = st.sidebar.radio("Page", ["Transcribe", "Cut Media"], index=0)
+    if page == "Cut Media":
+        render_cutter_page()
+        return
+
     settings = render_sidebar()
     render_header(settings["ollama_ok"])
 
@@ -508,13 +765,14 @@ def main() -> None:
     if uploaded is not None:
         try:
             validate_upload(uploaded.name, uploaded.size, DEFAULT_MAX_UPLOAD_BYTES)
-            if uploaded.name != st.session_state.uploaded_filename or uploaded.size != st.session_state.uploaded_file_size:
+            safe_name = sanitize_filename(uploaded.name)
+            if safe_name != st.session_state.uploaded_filename or uploaded.size != st.session_state.uploaded_file_size:
                 old_path = st.session_state.get("uploaded_file_path")
                 if old_path:
                     safe_unlink(Path(old_path))
                 path = save_uploaded_file(uploaded)
                 st.session_state.uploaded_file_path = str(path)
-                st.session_state.uploaded_filename = sanitize_filename(uploaded.name)
+                st.session_state.uploaded_filename = safe_name
                 st.session_state.uploaded_file_size = uploaded.size
                 log_message(f"Uploaded file saved: {st.session_state.uploaded_filename}")
         except Exception as exc:

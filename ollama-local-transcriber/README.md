@@ -7,6 +7,7 @@ This project is a local Streamlit web application that uses Faster-Whisper for s
 ## Features
 
 - Local audio and video transcription with Faster-Whisper.
+- Transcription language choices limited to Auto Detect, English, Tagalog, and Cebuano.
 - Local AI cleanup and summarization through Ollama.
 - Supported audio: MP3, WAV, M4A, AAC, FLAC, OGG.
 - Supported video: MP4, MKV, MOV, AVI, WEBM.
@@ -107,7 +108,7 @@ Streamlit will open the local app in your browser.
 ## How To Use
 
 1. Upload a supported audio or video file.
-2. Choose Whisper settings in the sidebar.
+2. Choose Whisper settings in the sidebar. Auto Detect is intended for English, Tagalog, and Cebuano only; if another language is detected, the app shows a warning but keeps the transcript.
 3. Click `Start Transcription`.
 4. Review or edit the raw transcript.
 5. If Ollama is available, run cleanup, summary, meeting minutes, action items, or all AI processing.
